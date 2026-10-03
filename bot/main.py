@@ -61,13 +61,15 @@ def insert_alert(kind, level, title, body, source, key):
 def tg_send(text, chat_ids=None):
     for cid in chat_ids or CHAT_IDS:
         try:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                 json={"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
                 timeout=15,
             )
+            if r.status_code != 200:
+                log.warning("Telegram HTTP %s: %s", r.status_code, r.text[:200])
         except Exception as e:
-            log.warning("Telegram erreur: %s", e)
+            log.warning("Telegram erreur: %s", type(e).__name__)  # jamais l'URL (contient le token)
 
 
 def notify(kind, level, title, body, source, key, emoji):
@@ -128,34 +130,42 @@ def utcnow():
 
 # ---------- Couche 1 : calendrier ----------
 CAL = {"ts": 0.0, "events": []}
-CAL_URLS = [
-    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
-]
+CAL_HOSTS = ["https://nfs.faireconomy.media", "https://cdn-nfs.faireconomy.media"]
+
+
+def _parse_events(data):
+    out = []
+    for e in data:
+        if e.get("country") != "USD" or e.get("impact") != "High":
+            continue
+        t = dt.datetime.fromisoformat(e["date"]).astimezone(dt.timezone.utc)
+        out.append({"title": e.get("title", "?"), "time": t, "forecast": e.get("forecast"),
+                    "previous": e.get("previous"), "actual": e.get("actual")})
+    return out
 
 
 def get_events():
     if time.time() - CAL["ts"] < 1800:
         return CAL["events"]
     events, ok = [], False
-    for url in CAL_URLS:
+    for host in CAL_HOSTS:  # semaine en cours : 1er hôte qui répond
         try:
-            r = requests.get(url, headers=UA, timeout=20)
+            r = requests.get(f"{host}/ff_calendar_thisweek.json", headers=UA, timeout=20)
             r.raise_for_status()
-            ok = True
-            for e in r.json():
-                if e.get("country") != "USD" or e.get("impact") != "High":
-                    continue
-                t = dt.datetime.fromisoformat(e["date"]).astimezone(dt.timezone.utc)
-                events.append({"title": e.get("title", "?"), "time": t,
-                               "forecast": e.get("forecast"), "previous": e.get("previous"),
-                               "actual": e.get("actual")})
+            events, ok = _parse_events(r.json()), True
+            try:  # semaine suivante : facultative (404 normal tant que non publiée)
+                r2 = requests.get(f"{host}/ff_calendar_nextweek.json", headers=UA, timeout=20)
+                if r2.status_code == 200:
+                    events += _parse_events(r2.json())
+            except Exception:
+                pass
+            break
         except Exception as ex:
-            log.warning("calendrier %s: %s", url.split("/")[-1], ex)
+            log.warning("calendrier %s: %s", host.split("//")[1], type(ex).__name__)
     if ok:
         CAL.update(ts=time.time(), events=events)
     else:
-        CAL["ts"] = time.time() - 1500  # nouvel essai dans 5 min
+        CAL["ts"] = time.time() - 1200  # nouvel essai dans 10 min (évite le 429)
     return CAL["events"]
 
 
@@ -266,6 +276,31 @@ PROMPT = (
 )
 
 
+GEM = {"model": GEMINI_MODEL, "tried_discovery": False}
+GEM_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def gemini_discover():
+    """Si le modèle configuré n'existe pas (404), choisit un modèle 'flash' disponible pour cette clé."""
+    GEM["tried_discovery"] = True
+    try:
+        r = requests.get(f"{GEM_BASE}/models", params={"key": GEMINI_KEY, "pageSize": 100}, timeout=20)
+        r.raise_for_status()
+        names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        log.info("Modèles Gemini disponibles: %s", ", ".join(names[:25]))
+        pref = [n for n in names if "flash" in n and "lite" in n and "preview" not in n] \
+            or [n for n in names if "flash" in n and "preview" not in n] \
+            or [n for n in names if "flash" in n] or names
+        if pref:
+            GEM["model"] = pref[0]
+            log.info("Modèle Gemini retenu: %s", GEM["model"])
+            return True
+    except Exception as e:
+        log.warning("Gemini discovery: %s", type(e).__name__)
+    return False
+
+
 def gemini_score(items):
     today = dt.date.today().isoformat()
     if STATE["gemini_day"] != today:
@@ -273,21 +308,24 @@ def gemini_score(items):
     if not GEMINI_KEY or STATE["gemini_calls"] >= GEMINI_DAILY_MAX:
         return None
     body = PROMPT + "\n".join(f"{i}. {it['title']}" for i, it in enumerate(items))
+    payload = {"contents": [{"parts": [{"text": body}]}],
+               "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1}}
     try:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            params={"key": GEMINI_KEY},
-            json={"contents": [{"parts": [{"text": body}]}],
-                  "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1}},
-            timeout=40,
-        )
-        STATE["gemini_calls"] += 1
-        r.raise_for_status()
+        for _ in range(2):
+            r = requests.post(f"{GEM_BASE}/models/{GEM['model']}:generateContent",
+                              params={"key": GEMINI_KEY}, json=payload, timeout=40)
+            STATE["gemini_calls"] += 1
+            if r.status_code == 404 and not GEM["tried_discovery"] and gemini_discover():
+                continue  # 2e essai avec le modèle découvert
+            break
+        if r.status_code != 200:
+            log.warning("Gemini HTTP %s (%s): %s", r.status_code, GEM["model"], r.text[:200])  # jamais l'URL/clé
+            return None
         txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         data = json.loads(txt)
         return {int(d["i"]): d for d in data}
     except Exception as e:
-        log.warning("Gemini: %s", e)
+        log.warning("Gemini: %s", type(e).__name__)
         return None
 
 
@@ -322,11 +360,23 @@ PRICES = deque()
 VOL = {"last_alert": 0.0}
 
 
+BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+
 def gold_price():
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{GOLD_SYMBOL}?interval=1m&range=1d"
-    r = requests.get(url, headers=UA, timeout=10)
+    """Prix de l'or : Yahoo (2 hôtes), puis Stooq (XAUUSD) en secours. Sans clé."""
+    for host in ("query1", "query2"):
+        try:
+            r = requests.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{GOLD_SYMBOL}"
+                             "?interval=1m&range=1d", headers=BROWSER_UA, timeout=10)
+            r.raise_for_status()
+            return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+        except Exception:
+            pass
+    r = requests.get("https://stooq.com/q/l/?s=xauusd&f=sd2t2c&h&e=csv", headers=BROWSER_UA, timeout=10)
     r.raise_for_status()
-    return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+    return float(r.text.strip().splitlines()[1].split(",")[-1])
 
 
 def check_volatility(s):
