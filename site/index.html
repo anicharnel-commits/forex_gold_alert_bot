@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gold Alert — Contrôle</title>
+<style>
+:root{--bg:#0e1116;--card:#171b22;--bd:#262c36;--tx:#e6e9ef;--mut:#8b94a3;--ok:#2ecc71;--ko:#e74c3c;--gold:#f0b429}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0}h2{font-size:15px;margin:0 0 12px;color:var(--gold)}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.grid{display:grid;gap:14px;grid-template-columns:1fr}
+@media(min-width:800px){.grid{grid-template-columns:1fr 1fr}}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px}
+label{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:8px 0;color:var(--mut)}
+input[type=number],input[type=text],input[type=email],input[type=password]{background:#0e1116;color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:8px;width:130px}
+#login input{width:100%;margin:6px 0}
+button{background:var(--gold);color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--mut);border:1px solid var(--bd)}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;background:var(--ko)}
+.dot.on{background:var(--ok)}
+.big{width:100%;padding:14px;font-size:16px}
+.big.off{background:var(--ko);color:#fff}
+.alert{border-top:1px solid var(--bd);padding:10px 0}
+.alert:first-child{border-top:0}
+.meta{color:var(--mut);font-size:12px}
+.lvl{display:inline-block;min-width:28px;text-align:center;border-radius:6px;padding:1px 6px;margin-right:6px;font-weight:700;color:#111}
+.l-hi{background:#e74c3c;color:#fff}.l-mid{background:#f39c12}.l-lo{background:#f1c40f}.l-no{background:#4a5360;color:#fff}
+#list{max-height:520px;overflow:auto}
+.msg{color:var(--mut);font-size:13px;margin-top:8px;min-height:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div id="login" class="card" style="max-width:360px;margin:60px auto">
+  <h1>Gold Alert</h1>
+  <p class="meta">Accès réservé (3 comptes).</p>
+  <input id="email" type="email" placeholder="Email" autocomplete="username">
+  <input id="pwd" type="password" placeholder="Mot de passe" autocomplete="current-password">
+  <button class="big" id="btnLogin">Se connecter</button>
+  <div class="msg" id="loginMsg"></div>
+</div>
+
+<div id="app" hidden>
+  <div class="top">
+    <h1>Gold Alert — Contrôle</h1>
+    <button class="ghost" id="btnOut">Déconnexion</button>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Statut</h2>
+      <div><span class="dot" id="dot"></span><b id="stTxt">…</b></div>
+      <div class="meta" id="stMeta"></div>
+      <div style="margin-top:12px"><button class="big" id="btnToggle">…</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Prochaines annonces (USD, impact élevé)</h2>
+      <div id="upcoming" class="meta">—</div>
+    </div>
+
+    <div class="card">
+      <h2>Réglages</h2>
+      <label>Seuil d'alerte (1–10) <input type="number" id="threshold" min="1" max="10"></label>
+      <label>Pré-alertes (minutes) <input type="text" id="pre" placeholder="60,15"></label>
+      <label>« Arrête le bot » : min avant <input type="number" id="sb" min="1"></label>
+      <label>« Relance » : min après <input type="number" id="sa" min="1"></label>
+      <label>Volatilité : seuil ($) <input type="number" id="vt" min="1" step="0.5"></label>
+      <label>Volatilité : fenêtre (min) <input type="number" id="vw" min="1"></label>
+      <label>Source calendrier <input type="checkbox" id="s1"></label>
+      <label>Source news (IA) <input type="checkbox" id="s2"></label>
+      <label>Source volatilité <input type="checkbox" id="s3"></label>
+      <button id="btnSave" style="margin-top:8px">Enregistrer</button>
+      <div class="msg" id="saveMsg"></div>
+    </div>
+
+    <div class="card">
+      <h2>Historique des alertes (temps réel)</h2>
+      <div id="list"></div>
+    </div>
+  </div>
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
+<script>
+const sb = supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY);
+const $ = id => document.getElementById(id);
+let settings = null;
+
+$("btnLogin").onclick = async () => {
+  $("loginMsg").textContent = "Connexion…";
+  const { error } = await sb.auth.signInWithPassword({ email: $("email").value.trim(), password: $("pwd").value });
+  if (error) $("loginMsg").textContent = "Erreur : " + error.message; else start();
+};
+$("btnOut").onclick = async () => { await sb.auth.signOut(); location.reload(); };
+
+async function init() {
+  const { data: { session } } = await sb.auth.getSession();
+  if (session) start();
+}
+
+async function start() {
+  $("login").hidden = true; $("app").hidden = false;
+  await loadSettings(); await loadStatus(); await loadAlerts();
+  sb.channel("live")
+    .on("postgres_changes", { event: "INSERT", schema: "public", table: "alerts" }, p => addAlert(p.new, true))
+    .on("postgres_changes", { event: "*", schema: "public", table: "bot_status" }, loadStatus)
+    .subscribe();
+  setInterval(loadStatus, 15000);
+}
+
+async function loadSettings() {
+  const { data } = await sb.from("settings").select("*").eq("id", 1).single();
+  settings = data; if (!data) return;
+  $("threshold").value = data.threshold;
+  $("pre").value = (data.pre_alert_minutes || []).join(",");
+  $("sb").value = data.stop_before_min; $("sa").value = data.stop_after_min;
+  $("vt").value = data.vol_threshold_usd; $("vw").value = data.vol_window_min;
+  $("s1").checked = data.src_calendar; $("s2").checked = data.src_news; $("s3").checked = data.src_volatility;
+  renderToggle();
+}
+
+function renderToggle() {
+  const b = $("btnToggle"), on = settings && settings.bot_enabled;
+  b.textContent = on ? "⏸ Mettre le bot en pause" : "▶️ Démarrer le bot";
+  b.className = "big" + (on ? "" : " off");
+}
+
+$("btnToggle").onclick = async () => {
+  const v = !settings.bot_enabled;
+  const { error } = await sb.from("settings").update({ bot_enabled: v, updated_at: new Date().toISOString() }).eq("id", 1);
+  if (!error) { settings.bot_enabled = v; renderToggle(); loadStatus(); }
+};
+
+$("btnSave").onclick = async () => {
+  const pre = $("pre").value.split(",").map(x => parseInt(x.trim())).filter(x => x > 0);
+  const upd = {
+    threshold: Math.min(10, Math.max(1, parseInt($("threshold").value) || 7)),
+    pre_alert_minutes: pre.length ? pre : [60, 15],
+    stop_before_min: parseInt($("sb").value) || 15, stop_after_min: parseInt($("sa").value) || 30,
+    vol_threshold_usd: parseFloat($("vt").value) || 15, vol_window_min: parseInt($("vw").value) || 5,
+    src_calendar: $("s1").checked, src_news: $("s2").checked, src_volatility: $("s3").checked,
+    updated_at: new Date().toISOString()
+  };
+  const { error } = await sb.from("settings").update(upd).eq("id", 1);
+  $("saveMsg").textContent = error ? "Erreur : " + error.message : "✅ Enregistré (le bot applique sous 30 s)";
+  if (!error) Object.assign(settings, upd);
+};
+
+async function loadStatus() {
+  const { data } = await sb.from("bot_status").select("*").eq("id", 1).single();
+  if (!data) return;
+  const last = data.last_cycle ? new Date(data.last_cycle) : null;
+  const online = last && (Date.now() - last.getTime()) < 120000;
+  const enabled = data.info && data.info.enabled !== false;
+  $("dot").className = "dot" + (online ? " on" : "");
+  $("stTxt").textContent = !online ? "Bot hors ligne" : enabled ? "Bot en ligne — alertes actives" : "Bot en ligne — en pause";
+  const gold = data.info && data.info.gold;
+  $("stMeta").textContent = "Dernier cycle : " + (last ? last.toLocaleTimeString() : "—") +
+    " • Or : " + (gold ? gold + " $" : "—") + " • Gemini aujourd'hui : " + (data.gemini_calls || 0);
+  const up = (data.info && data.info.upcoming) || [];
+  const box = $("upcoming"); box.textContent = "";
+  if (!up.length) box.textContent = "Aucune annonce à venir.";
+  up.forEach(u => {
+    const d = document.createElement("div"); d.style.margin = "4px 0";
+    d.textContent = new Date(u.time).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" }) + " — " + u.title;
+    box.appendChild(d);
+  });
+}
+
+function lvlClass(n) { return n >= 8 ? "l-hi" : n >= 6 ? "l-mid" : n >= 4 ? "l-lo" : "l-no"; }
+
+function addAlert(a, top) {
+  const d = document.createElement("div"); d.className = "alert";
+  const t = document.createElement("div");
+  const l = document.createElement("span"); l.className = "lvl " + lvlClass(a.level); l.textContent = a.level;
+  const b = document.createElement("b"); b.textContent = a.title;
+  t.append(l, b);
+  const body = document.createElement("div"); body.className = "meta"; body.style.whiteSpace = "pre-wrap"; body.textContent = a.body || "";
+  const m = document.createElement("div"); m.className = "meta";
+  m.textContent = new Date(a.created_at).toLocaleString() + " • " + a.kind + (a.source ? " • " + a.source : "");
+  d.append(t, body, m);
+  const list = $("list");
+  top ? list.prepend(d) : list.appendChild(d);
+}
+
+async function loadAlerts() {
+  const { data } = await sb.from("alerts").select("*").order("created_at", { ascending: false }).limit(60);
+  $("list").textContent = "";
+  (data || []).forEach(a => addAlert(a, false));
+  if (!data || !data.length) $("list").textContent = "Aucune alerte pour le moment.";
+}
+
+init();
+</script>
+</body>
+</html>

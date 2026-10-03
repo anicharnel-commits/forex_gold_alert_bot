@@ -1,0 +1,4 @@
+window.CFG = {
+  SUPABASE_URL: "https://mzbxzgyhfnmztdcydlpv.supabase.co",
+  SUPABASE_ANON_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im16Ynh6Z3loZm5tenRkY3lkbHB2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA5NzQxNzgsImV4cCI6MjEwNjU1MDE3OH0.DYnrNR_heC21ts3mm_uElUcsYrFbiE8PGWlRoPnYe4Q"
+};
